@@ -1,0 +1,43 @@
+{
+  "name": "gemini-live-check",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc && node dist/check-live.js",
+    "tool-bench": "tsc && node dist/tool-bench.js",
+    "bench:external-wait": "tsc && node dist/external-wait-bench.js",
+    "bench:external-wait:tick-compare": "tsc && node dist/external-wait-tick-compare.js",
+    "bench:external-wait:batch": "tsc && node dist/external-wait-batch.js",
+    "tau:live-tool-1008-probe": "tsc && node dist/tau-live-tool-1008-probe.js",
+    "tau:live-tool-tick-factor-probe": "tsc && node dist/tau-live-tool-tick-factor-probe.js",
+    "tau:live-tool-formal-benchmark": "tsc && node dist/tau-live-tool-formal-benchmark.js",
+    "tau:live-tool-final-handoff-probe": "tsc && node dist/tau-live-tool-final-handoff-probe.js",
+    "tau:live-tool-final-result-channel-probe": "tsc && node dist/tau-live-tool-final-result-channel-probe.js",
+    "tau:live-tool-waiting-speech-ablation-probe": "tsc && node dist/tau-live-tool-waiting-speech-ablation-probe.js",
+    "plot:external-wait-batch": "python3 scripts/plot_external_wait_batch.py",
+    "report:external-wait-visuals": "python3 scripts/make_external_wait_report_visuals.py",
+    "asr:external-wait": "python3 scripts/asr_external_wait_audio.py",
+    "asr:formal-benchmark": "python3 scripts/asr_formal_benchmark.py",
+    "judge:formal-gemma": "tsc && node dist/judge-formal-benchmark-gemma.js",
+    "analyze:waiting-self-bleu": "python3 scripts/analyze_waiting_self_bleu_diversity.py",
+    "analyze:asr-answer-phrases": "python3 scripts/analyze_asr_answer_phrases.py",
+    "analyze:asr-diversity": "python3 scripts/analyze_asr_transcript_diversity.py",
+    "asr:check": "python3 scripts/check_asr_env.py",
+    "bench:batch": "tsc && node dist/tool-bench-batch.js",
+    "debug:1008": "tsc && node dist/debug-1008-matrix.js",
+    "debug:prompt-1008": "tsc && node dist/debug-prompt-1008.js",
+    "analyze-tool-bench": "python3 scripts/analyze-tool-bench.py",
+    "visualize-timeline": "python3 scripts/visualize_timeline.py",
+    "migrate-legacy-results": "python3 scripts/migrate_legacy_results.py"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}

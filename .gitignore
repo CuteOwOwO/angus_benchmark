@@ -1,0 +1,22 @@
+# Dependencies and build output
+node_modules/
+dist/
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+
+# Large generated benchmark artifacts
+logs/
+result/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# OS/editor noise
+.DS_Store
+.vscode/
+.idea/
+
