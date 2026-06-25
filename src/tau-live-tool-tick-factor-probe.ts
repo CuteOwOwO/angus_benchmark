@@ -1,6 +1,7 @@
 import { Behavior, GoogleGenAI, Modality } from "@google/genai";
 import { config as loadEnv } from "dotenv";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1045,7 +1046,8 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const apiKey = requireEnv("GEMINI_API_KEY");
   const model = requireEnv("GEMINI_LIVE_MODEL");
-  const resultId = `${timestampForPath()}_tau_live_tool_tick_factor_probe`;
+  const uniqueRunSuffix = `${process.pid}_${randomUUID().slice(0, 8)}`;
+  const resultId = `${timestampForPath()}_${uniqueRunSuffix}_tau_live_tool_tick_factor_probe`;
   const resultDir = resolve(RESULT_DIR, resultId);
   mkdirSync(resultDir, { recursive: true });
 
