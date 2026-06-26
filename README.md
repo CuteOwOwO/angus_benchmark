@@ -130,6 +130,12 @@ The most important result folder from the formal run is:
 result/2026-06-22_11-15-58-195_tau_live_tool_formal_benchmark
 ```
 
+## 1008 WebSocket Fix Notes
+
+The `fix/websocket-1008` branch documents a protocol-alignment pass that removed the reproduced `1008` instability from the formal benchmark reruns. The short version is: wait for `setupComplete`, send external ticks through `sendRealtimeInput(...)`, respect `toolCallCancellation`, keep final results on native `sendToolResponse(...)`, and preserve the post-final observation window.
+
+Details and evidence are in [docs/1008-websocket-fix.md](docs/1008-websocket-fix.md).
+
 ## Prompts
 
 Prompt files are separated so no-tick and tick runs can evolve independently.
@@ -361,4 +367,3 @@ Recommended before publishing:
 - do not commit `node_modules/` or `dist/`;
 - do not commit large `result/` or `logs/` folders unless you intentionally want the benchmark artifacts in the repository;
 - consider publishing a small curated result sample and keeping large audio/result archives elsewhere.
-
