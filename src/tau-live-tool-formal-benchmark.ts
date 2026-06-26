@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
@@ -82,6 +82,10 @@ type CellSummary = {
   post_final_answer_latency_ms_median: number | null;
 };
 
+type CliArgs = {
+  cellConcurrency: number;
+};
+
 const PROJECT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const RESULT_DIR = resolve(PROJECT_DIR, "result");
 const PROBE = resolve(PROJECT_DIR, "dist", "tau-live-tool-tick-factor-probe.js");
@@ -92,7 +96,47 @@ const CONDITIONS: Array<{ condition: Condition; tickMode: string }> = [
 const LATENCIES_MS = [3000, 5000, 8000, 12000];
 const TARGET_VALID = 10;
 const MAX_ATTEMPTS_PER_CELL = Number(process.env.FORMAL_MAX_ATTEMPTS_PER_CELL ?? 80);
+const DEFAULT_CELL_CONCURRENCY = Math.max(1, Number(process.env.FORMAL_CELL_CONCURRENCY ?? 1));
 const PCM_BYTES_PER_SECOND = 48_000;
+
+function usage(): string {
+  return [
+    "Usage: tau-live-tool-formal-benchmark [options]",
+    "",
+    "Options:",
+    "  --cell-concurrency <n>  Number of single-attempt probes to run concurrently within each condition x latency cell.",
+    "                          Default: FORMAL_CELL_CONCURRENCY or 1.",
+    "  --help                  Show this help.",
+  ].join("\n");
+}
+
+function parseArgs(argv: string[]): CliArgs {
+  const args: CliArgs = { cellConcurrency: DEFAULT_CELL_CONCURRENCY };
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === "--help" || arg === "-h") {
+      console.log(usage());
+      process.exit(0);
+    }
+    if (arg === "--cell-concurrency") {
+      const value = argv[index + 1];
+      if (!value) throw new Error("--cell-concurrency requires a value");
+      args.cellConcurrency = Number(value);
+      index += 1;
+      continue;
+    }
+    const inlineConcurrency = arg.match(/^--cell-concurrency=(\d+)$/);
+    if (inlineConcurrency) {
+      args.cellConcurrency = Number(inlineConcurrency[1]);
+      continue;
+    }
+    throw new Error(`Unknown argument: ${arg}\n${usage()}`);
+  }
+  if (!Number.isInteger(args.cellConcurrency) || args.cellConcurrency < 1) {
+    throw new Error(`Invalid --cell-concurrency: ${args.cellConcurrency}`);
+  }
+  return args;
+}
 
 function timestampForPath(date = new Date()): string {
   const [datePart, timePart] = date.toISOString().split("T");
@@ -210,6 +254,54 @@ function runProbeAttempt(tickMode: string, latencyMs: number): string {
   if (result.stderr) console.error(result.stderr);
   if (result.status !== 0) throw new Error(`Probe exited with status ${result.status ?? "unknown"}`);
   return findLatestProbeDir(before, result.stdout);
+}
+
+function runProbeAttemptAsync(tickMode: string, latencyMs: number): Promise<string> {
+  const before = listProbeDirs();
+  return new Promise((resolveRun, rejectRun) => {
+    const child = spawn(process.execPath, [
+      PROBE,
+      "--tick-modes",
+      tickMode,
+      "--attempts",
+      "1",
+      "--latency-ms",
+      String(latencyMs),
+      "--quiet-terminal-text",
+    ], {
+      cwd: PROJECT_DIR,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+      for (const line of chunk.split(/\n/).filter(Boolean)) {
+        if (/Result directory|Attempts:|\] start|\] valid|\] not_valid|\] 1008|\] 1011|Summary:|Final comparison:/.test(line)) {
+          console.log(`  ${line}`);
+        }
+      }
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.on("error", rejectRun);
+    child.on("close", (status) => {
+      if (stderr) console.error(stderr);
+      if (status !== 0) {
+        rejectRun(new Error(`Probe exited with status ${status ?? "unknown"}`));
+        return;
+      }
+      try {
+        resolveRun(findLatestProbeDir(before, stdout));
+      } catch (error) {
+        rejectRun(error);
+      }
+    });
+  });
 }
 
 function firstEventMs(events: Array<Record<string, any>>, type: string): number | null {
@@ -393,11 +485,11 @@ function summarizeCell(condition: Condition, latencyMs: number, attempts: Attemp
   };
 }
 
-function writeFinalMarkdown(resultDir: string, rows: CellSummary[]): void {
+function writeFinalMarkdown(resultDir: string, rows: CellSummary[], cellConcurrency: number): void {
   const lines = [
     "# Tau Live Tool Formal Benchmark",
     "",
-    "Frozen setting: native tool call, native `sendToolResponse(...)` final result, explicit `TOOL_RESULT` final payload, post-final observation window of 8000 ms, concurrency 1.",
+    `Frozen setting: native tool call, native \`sendToolResponse(...)\` final result, explicit \`TOOL_RESULT\` final payload, post-final observation window of 8000 ms, cell concurrency ${cellConcurrency}.`,
     "",
     "Valid definition: an attempt is valid when the tool call succeeds, final tool response is sent, and post-final model output mentions the final order result (`shipped`, `UPS`, tracking, or `tomorrow`). The underlying probe also requires no 1008/1011 close for `session_valid`.",
     "",
@@ -430,7 +522,79 @@ function writeFinalMarkdown(resultDir: string, rows: CellSummary[]): void {
   writeFileSync(resolve(resultDir, "final_comparison.md"), `${lines.join("\n")}\n`, "utf8");
 }
 
+async function runCell(params: {
+  condition: Condition;
+  tickMode: string;
+  latencyMs: number;
+  cellDir: string;
+  cellConcurrency: number;
+  allAttempts: AttemptRecord[];
+}): Promise<AttemptRecord[]> {
+  const { condition, tickMode, latencyMs, cellDir, cellConcurrency, allAttempts } = params;
+  const cellAttempts: AttemptRecord[] = [];
+  let valid = 0;
+  let launched = 0;
+  let active = 0;
+  let done = false;
+
+  return await new Promise<AttemptRecord[]>((resolveCell, rejectCell) => {
+    const maybeLaunch = () => {
+      if (done) return;
+      if (valid >= TARGET_VALID && active === 0) {
+        done = true;
+        resolveCell(cellAttempts);
+        return;
+      }
+      while (
+        active < cellConcurrency &&
+        launched < MAX_ATTEMPTS_PER_CELL &&
+        valid + active < TARGET_VALID
+      ) {
+        launched += 1;
+        active += 1;
+        const formalAttemptIndex = launched;
+        console.log(
+          `[${condition} ${latencyMs}ms attempt ${formalAttemptIndex}] running ` +
+            `(active=${active}/${cellConcurrency}, valid=${valid}/${TARGET_VALID})`,
+        );
+        Promise.resolve()
+          .then(async () => {
+            const sourceRunDir = await runProbeAttemptAsync(tickMode, latencyMs);
+            const copied = copyAttempt(sourceRunDir, tickMode, cellDir, formalAttemptIndex);
+            copied.record.condition = condition;
+            copied.record.latency_ms = latencyMs;
+            copied.record.tick_mode = tickMode;
+            copied.record.tick_status = tickStatus(condition, latencyMs, copied.summary);
+            writeJson(resolve(copied.attemptDir, "formal_attempt_summary.json"), copied.record);
+            cellAttempts.push(copied.record);
+            allAttempts.push(copied.record);
+            if (copied.record.session_valid) valid += 1;
+            console.log(
+              `[${condition} ${latencyMs}ms attempt ${formalAttemptIndex}] ${
+                copied.record.session_valid ? "valid" : copied.record.close_1008 ? "1008" : copied.record.close_1011 ? "1011" : "not_valid"
+              } valid=${valid}/${TARGET_VALID}`,
+            );
+          })
+          .then(() => {
+            active -= 1;
+            maybeLaunch();
+          })
+          .catch((error) => {
+            done = true;
+            rejectCell(error);
+          });
+      }
+      if (active === 0 && (valid >= TARGET_VALID || launched >= MAX_ATTEMPTS_PER_CELL)) {
+        done = true;
+        resolveCell(cellAttempts);
+      }
+    };
+    maybeLaunch();
+  });
+}
+
 async function main(): Promise<void> {
+  const args = parseArgs(process.argv.slice(2));
   const resultId = `${timestampForPath()}_tau_live_tool_formal_benchmark`;
   const resultDir = resolve(RESULT_DIR, resultId);
   mkdirSync(resultDir, { recursive: true });
@@ -442,7 +606,8 @@ async function main(): Promise<void> {
     max_attempts_per_cell: MAX_ATTEMPTS_PER_CELL,
     tick_rule: "external_single_tick sends one natural pending signal at 4000ms only when latency_ms > 4000",
     post_final_observation_ms: 8000,
-    concurrency: 1,
+    concurrency: args.cellConcurrency,
+    concurrency_scope: "within each condition x latency cell; each worker runs one single-attempt probe process",
   });
 
   const allAttempts: AttemptRecord[] = [];
@@ -452,28 +617,15 @@ async function main(): Promise<void> {
     for (const latencyMs of LATENCIES_MS) {
       const cellDir = resolve(resultDir, `condition_${condition}`, `latency_${latencyMs}ms`);
       mkdirSync(cellDir, { recursive: true });
-      const cellAttempts: AttemptRecord[] = [];
-      let valid = 0;
-      console.log(`\n=== ${condition} latency=${latencyMs}ms target_valid=${TARGET_VALID} ===`);
-      while (valid < TARGET_VALID && cellAttempts.length < MAX_ATTEMPTS_PER_CELL) {
-        const formalAttemptIndex = cellAttempts.length + 1;
-        console.log(`[${condition} ${latencyMs}ms attempt ${formalAttemptIndex}] running`);
-        const sourceRunDir = runProbeAttempt(tickMode, latencyMs);
-        const copied = copyAttempt(sourceRunDir, tickMode, cellDir, formalAttemptIndex);
-        copied.record.condition = condition;
-        copied.record.latency_ms = latencyMs;
-        copied.record.tick_mode = tickMode;
-        copied.record.tick_status = tickStatus(condition, latencyMs, copied.summary);
-        writeJson(resolve(copied.attemptDir, "formal_attempt_summary.json"), copied.record);
-        cellAttempts.push(copied.record);
-        allAttempts.push(copied.record);
-        if (copied.record.session_valid) valid += 1;
-        console.log(
-          `[${condition} ${latencyMs}ms attempt ${formalAttemptIndex}] ${
-            copied.record.session_valid ? "valid" : copied.record.close_1008 ? "1008" : copied.record.close_1011 ? "1011" : "not_valid"
-          } valid=${valid}/${TARGET_VALID}`,
-        );
-      }
+      console.log(`\n=== ${condition} latency=${latencyMs}ms target_valid=${TARGET_VALID} cell_concurrency=${args.cellConcurrency} ===`);
+      const cellAttempts = await runCell({
+        condition,
+        tickMode,
+        latencyMs,
+        cellDir,
+        cellConcurrency: args.cellConcurrency,
+        allAttempts,
+      });
       const row = summarizeCell(condition, latencyMs, cellAttempts);
       rows.push(row);
       writeJson(resolve(cellDir, "summary.json"), { ...row, attempts: cellAttempts });
@@ -488,7 +640,7 @@ async function main(): Promise<void> {
   writeJson(resolve(resultDir, "summary.json"), { result_id: resultId, rows, attempts: allAttempts });
   writeCsv(resolve(resultDir, "summary.csv"), rows as unknown as Array<Record<string, unknown>>);
   writeCsv(resolve(resultDir, "attempts.csv"), allAttempts as unknown as Array<Record<string, unknown>>);
-  writeFinalMarkdown(resultDir, rows);
+  writeFinalMarkdown(resultDir, rows, args.cellConcurrency);
 
   const plot = spawnSync("python3", [resolve(PROJECT_DIR, "scripts", "plot_tau_live_tool_formal_benchmark.py"), resultDir], {
     cwd: PROJECT_DIR,

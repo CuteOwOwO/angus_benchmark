@@ -1,6 +1,7 @@
 import { Behavior, GoogleGenAI, Modality } from "@google/genai";
 import { config as loadEnv } from "dotenv";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -154,6 +155,7 @@ type LiveMessage = {
 
 type Session = {
   sendClientContent(params: { turns?: string; turnComplete?: boolean }): void;
+  sendRealtimeInput(params: { text?: string }): void;
   sendToolResponse(params: {
     functionResponses: {
       id?: string;
@@ -205,6 +207,7 @@ type CheckStatusRecord = {
 };
 
 type AttemptState = {
+  setupCompleteAt?: number;
   promptSentAt?: number;
   closeCode: number | null;
   closeReason: string | null;
@@ -226,6 +229,7 @@ type AttemptState = {
   textAfterFinal: string[];
   ticks: TickRecord[];
   checkStatusCalls: CheckStatusRecord[];
+  cancelledToolCallIds: string[];
   sendErrors: string[];
   errors: string[];
 };
@@ -252,11 +256,14 @@ type AttemptSummary = {
   post_tool_final_latency_ms: number | null;
   first_audio_time_ms: number | null;
   turnComplete_time_ms: number | null;
+  setupComplete_time_ms: number | null;
+  setup_complete_before_prompt: boolean;
   last_audio_before_final_tool_response_ms: number | null;
   raw_event_count: number;
   text_before_final: string[];
   text_after_final: string[];
   check_status_calls: CheckStatusRecord[];
+  cancelled_tool_call_ids: string[];
   send_errors: string[];
   errors: string[];
   result_dir: string;
@@ -539,11 +546,14 @@ function computeSummary(plan: AttemptPlan, state: AttemptState): AttemptSummary 
         : null,
     first_audio_time_ms: msDelta(state.promptSentAt, state.firstAudioAt),
     turnComplete_time_ms: msDelta(state.promptSentAt, state.turnCompleteAt),
+    setupComplete_time_ms: msDelta(state.promptSentAt, state.setupCompleteAt),
+    setup_complete_before_prompt: Boolean(state.setupCompleteAt && state.promptSentAt && state.setupCompleteAt <= state.promptSentAt),
     last_audio_before_final_tool_response_ms: msDelta(state.promptSentAt, state.lastAudioBeforeFinalAt),
     raw_event_count: state.rawEventCount,
     text_before_final: state.textBeforeFinal,
     text_after_final: state.textAfterFinal,
     check_status_calls: state.checkStatusCalls,
+    cancelled_tool_call_ids: state.cancelledToolCallIds,
     send_errors: state.sendErrors,
     errors: state.errors,
     result_dir: plan.attemptDir,
@@ -573,6 +583,7 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
     textAfterFinal: [],
     ticks: [],
     checkStatusCalls: [],
+    cancelledToolCallIds: [],
     sendErrors: [],
     errors: [],
   };
@@ -580,6 +591,7 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
   let done = false;
   let resolveRunRef: (() => void) | undefined;
   let postFinalObservationScheduled = false;
+  let initialPromptSent = false;
   const timers: ReturnType<typeof setTimeout>[] = [];
   const jobId = `job_${plan.tickMode}_${plan.attemptIndex}_${Date.now()}`;
 
@@ -604,6 +616,22 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
     appendTimeline("send_error", { send_type: type, error: summary });
     appendJsonl(rawLogPath, { type: "send_error", send_type: type, error: summary });
     return summary;
+  };
+
+  const isCancelledCall = (call: FunctionCall): boolean => Boolean(call.id && state.cancelledToolCallIds.includes(call.id));
+
+  const sendInitialUserPrompt = () => {
+    if (initialPromptSent || done || state.sessionClosed || !session) return;
+    initialPromptSent = true;
+    session.sendClientContent({ turns: prompt.userPrompt, turnComplete: true });
+    state.promptSentAt = Date.now();
+    appendTimeline("user_message_sent", { prompt_name: prompt.promptName, prompt: prompt.userPrompt, sent_after_setup_complete: Boolean(state.setupCompleteAt) });
+    appendJsonl(rawLogPath, {
+      type: "user_message_sent",
+      prompt_name: prompt.promptName,
+      prompt: prompt.userPrompt,
+      sent_after_setup_complete: Boolean(state.setupCompleteAt),
+    });
   };
 
   const schedulePostFinalObservation = () => {
@@ -641,6 +669,19 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
   };
 
   const sendToolResponse = (call: FunctionCall, response: Record<string, unknown>, responseKind: string): boolean => {
+    if (isCancelledCall(call)) {
+      const summary = `skipped ${responseKind}: tool call ${call.id} was cancelled by server`;
+      state.sendErrors.push(summary);
+      appendTimeline("tool_response_skipped_cancelled_call", { function_call_id: call.id, function_name: call.name, response_kind: responseKind });
+      appendJsonl(rawLogPath, {
+        type: "tool_response_skipped_cancelled_call",
+        event_ms: state.promptSentAt ? Date.now() - state.promptSentAt : null,
+        function_call_id: call.id,
+        function_name: call.name,
+        response_kind: responseKind,
+      });
+      return false;
+    }
     try {
       session?.sendToolResponse({
         functionResponses: [{ id: call.id, name: call.name || MAIN_TOOL_NAME, response }],
@@ -680,12 +721,19 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
           const sentAtMs = Date.now() - (state.promptSentAt ?? Date.now());
           const tick: TickRecord = { kind: "client_status", sentAtMs };
           try {
-            session?.sendClientContent({
-              turns: clientPendingMessage(),
-              turnComplete: true,
+            session?.sendRealtimeInput({ text: clientPendingMessage() });
+            appendTimeline("client_status_tick_sent", {
+              tick_ms: tickMs,
+              send_method: "sendRealtimeInput",
+              message: clientPendingMessage(),
             });
-            appendTimeline("client_status_tick_sent", { tick_ms: tickMs, payload: pendingPayload(), message: clientPendingMessage() });
-            appendJsonl(rawLogPath, { type: "client_status_tick_sent", event_ms: sentAtMs, tick_ms: tickMs, payload: pendingPayload(), message: clientPendingMessage() });
+            appendJsonl(rawLogPath, {
+              type: "client_status_tick_sent",
+              event_ms: sentAtMs,
+              tick_ms: tickMs,
+              send_method: "sendRealtimeInput",
+              message: clientPendingMessage(),
+            });
           } catch (error) {
             tick.sendError = noteSendError("client_status_tick", error);
           }
@@ -743,6 +791,23 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
             const eventMs = state.promptSentAt ? now - state.promptSentAt : null;
             appendJsonl(rawLogPath, { type: "server_event", event_ms: eventMs, event_types: eventTypes(message), message: sanitizeMessage(message) });
             appendTimeline("server_event", { event_types: eventTypes(message) });
+
+            if (message.setupComplete) {
+              state.setupCompleteAt ??= now;
+              appendTimeline("setup_complete", { setup_complete_before_prompt: !state.promptSentAt });
+              appendJsonl(rawLogPath, {
+                type: "setup_complete",
+                event_ms: state.promptSentAt ? now - state.promptSentAt : null,
+                setup_complete_before_prompt: !state.promptSentAt,
+              });
+              try {
+                sendInitialUserPrompt();
+              } catch (error) {
+                noteSendError("initial_user_prompt", error);
+                finish(resolveRunRef ?? (() => undefined));
+              }
+              return;
+            }
 
             const parts = message.serverContent?.modelTurn?.parts ?? [];
             const textPieces = [
@@ -831,6 +896,18 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
               }
             }
 
+            if (message.toolCallCancellation?.ids?.length) {
+              for (const id of message.toolCallCancellation.ids) {
+                if (!state.cancelledToolCallIds.includes(id)) state.cancelledToolCallIds.push(id);
+              }
+              appendTimeline("tool_call_cancellation_received", { ids: message.toolCallCancellation.ids });
+              appendJsonl(rawLogPath, {
+                type: "tool_call_cancellation_received",
+                event_ms: state.promptSentAt ? Date.now() - state.promptSentAt : null,
+                ids: message.toolCallCancellation.ids,
+              });
+            }
+
             if (message.serverContent?.turnComplete) {
               state.turnCompleteAt ??= now;
               appendTimeline("turn_complete");
@@ -854,11 +931,6 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
           },
         },
       })) as Session;
-
-      session.sendClientContent({ turns: prompt.userPrompt, turnComplete: true });
-      state.promptSentAt = Date.now();
-      appendTimeline("user_message_sent", { prompt_name: prompt.promptName, prompt: prompt.userPrompt });
-      appendJsonl(rawLogPath, { type: "user_message_sent", prompt_name: prompt.promptName, prompt: prompt.userPrompt });
     } catch (error) {
       state.errors.push(summarizeError(error));
       appendTimeline("run_error", { error: summarizeError(error) });
@@ -974,7 +1046,8 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const apiKey = requireEnv("GEMINI_API_KEY");
   const model = requireEnv("GEMINI_LIVE_MODEL");
-  const resultId = `${timestampForPath()}_tau_live_tool_tick_factor_probe`;
+  const uniqueRunSuffix = `${process.pid}_${randomUUID().slice(0, 8)}`;
+  const resultId = `${timestampForPath()}_${uniqueRunSuffix}_tau_live_tool_tick_factor_probe`;
   const resultDir = resolve(RESULT_DIR, resultId);
   mkdirSync(resultDir, { recursive: true });
 
