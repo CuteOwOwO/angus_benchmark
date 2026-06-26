@@ -136,6 +136,8 @@ The `fix/websocket-1008` branch documents a protocol-alignment pass that removed
 
 Details and evidence are in [docs/1008-websocket-fix.md](docs/1008-websocket-fix.md).
 
+The formal benchmark also supports per-cell concurrent execution. Implementation notes, the result-directory collision fix, and measured speedup are in [docs/concurrent-formal-benchmark.md](docs/concurrent-formal-benchmark.md).
+
 ## Prompts
 
 Prompt files are separated so no-tick and tick runs can evolve independently.
