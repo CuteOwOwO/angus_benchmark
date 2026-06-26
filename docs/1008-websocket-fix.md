@@ -169,7 +169,7 @@ The project's metric needs to know whether the model eventually answers after th
 Result folder:
 
 ```text
-result/2026-06-25_11-37-26-322_tau_live_tool_formal_benchmark
+result/archived_2026-06-25_fix_websocket_api_runs/sequential_1137_formal_benchmark
 ```
 
 Overall:
@@ -187,7 +187,7 @@ This was the first strong signal that the WebSocket/protocol changes removed the
 Result folder:
 
 ```text
-result/2026-06-25_12-24-46-164_tau_live_tool_formal_benchmark
+result/archived_2026-06-25_fix_websocket_api_runs/concurrent_1224_formal_benchmark
 ```
 
 Overall:
@@ -299,4 +299,3 @@ Key areas in the probe:
 - cancellation handling via `toolCallCancellation`;
 - post-final observation window;
 - raw log and timeline fields for verifying event order.
-
