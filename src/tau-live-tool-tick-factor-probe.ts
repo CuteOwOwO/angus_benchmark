@@ -23,7 +23,9 @@ import {
 
 const PROJECT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_ENV_FILE = resolve(PROJECT_DIR, "..", "angus_bench", ".env");
-const RESULT_DIR = resolve(PROJECT_DIR, "result");
+const RESULT_DIR = process.env.GEMINI_LIVE_CHECK_RESULT_DIR
+  ? resolve(process.env.GEMINI_LIVE_CHECK_RESULT_DIR)
+  : resolve(PROJECT_DIR, "result");
 const MAIN_TOOL_NAME = "get_order_details";
 const CHECK_STATUS_TOOL_NAME = "check_status";
 const DEFAULT_LATENCY_MS = 8000;
@@ -31,6 +33,8 @@ const DEFAULT_ATTEMPTS_PER_CONDITION = 10;
 const MAX_ATTEMPT_MS = 45_000;
 const POST_FINAL_WAIT_MS = 8000;
 const TICK_TIMES_MS = [4000];
+const AUDIO_IDLE_BOUNDARY_MS = 300;
+const REPEAT_BOUNDARY_MIN_GAP_MS = 2500;
 
 const FINAL_ORDER_RESPONSE = {
   order_id: "#A123",
@@ -73,7 +77,17 @@ function finalPayload(): Record<string, unknown> {
 }
 
 function finalToolResponsePayload(tickMode: TickMode): Record<string, unknown> {
-  if (tickMode === "client_status_tick_3000ms" || tickMode === "native_no_tick") {
+  if (
+    tickMode === "client_status_tick_3000ms" ||
+    tickMode === "periodic_tick_4s" ||
+    tickMode === "tick_after_utterance_0s" ||
+    tickMode === "tick_after_utterance_1s" ||
+    tickMode === "tick_after_audio_idle_0s" ||
+    tickMode === "tick_after_audio_idle_1s" ||
+    tickMode === "tick_after_audio_idle_repeat_0s" ||
+    tickMode === "tick_after_audio_idle_repeat_1s" ||
+    tickMode === "native_no_tick"
+  ) {
     return {
       event_type: "TOOL_RESULT",
       phase: "final",
@@ -90,12 +104,26 @@ function finalToolResponsePayload(tickMode: TickMode): Record<string, unknown> {
 type TickMode =
   | "native_no_tick"
   | "client_status_tick_3000ms"
+  | "periodic_tick_4s"
+  | "tick_after_utterance_0s"
+  | "tick_after_utterance_1s"
+  | "tick_after_audio_idle_0s"
+  | "tick_after_audio_idle_1s"
+  | "tick_after_audio_idle_repeat_0s"
+  | "tick_after_audio_idle_repeat_1s"
   | "same_call_pending_function_response_3000ms"
   | "async_tool_polling";
 
 const TICK_MODES: TickMode[] = [
   "native_no_tick",
   "client_status_tick_3000ms",
+  "periodic_tick_4s",
+  "tick_after_utterance_0s",
+  "tick_after_utterance_1s",
+  "tick_after_audio_idle_0s",
+  "tick_after_audio_idle_1s",
+  "tick_after_audio_idle_repeat_0s",
+  "tick_after_audio_idle_repeat_1s",
   "same_call_pending_function_response_3000ms",
   "async_tool_polling",
 ];
@@ -113,12 +141,34 @@ const TICK_MODE_ALIASES: Record<string, TickMode> = {
   with_tick_external: "client_status_tick_3000ms",
   external_tick: "client_status_tick_3000ms",
   client_status_tick_3000ms: "client_status_tick_3000ms",
+  fixed_single_tick_4s: "client_status_tick_3000ms",
+  periodic_tick_4s: "periodic_tick_4s",
+  fixed_periodic_tick_4s: "periodic_tick_4s",
+  tick_after_utterance_0s: "tick_after_utterance_0s",
+  boundary_tick_0s: "tick_after_utterance_0s",
+  tick_after_utterance_1s: "tick_after_utterance_1s",
+  boundary_tick_1s: "tick_after_utterance_1s",
+  tick_after_audio_idle_0s: "tick_after_audio_idle_0s",
+  audio_idle_tick_0s: "tick_after_audio_idle_0s",
+  tick_after_audio_idle_1s: "tick_after_audio_idle_1s",
+  audio_idle_tick_1s: "tick_after_audio_idle_1s",
+  tick_after_audio_idle_repeat_0s: "tick_after_audio_idle_repeat_0s",
+  audio_idle_repeat_tick_0s: "tick_after_audio_idle_repeat_0s",
+  tick_after_audio_idle_repeat_1s: "tick_after_audio_idle_repeat_1s",
+  audio_idle_repeat_tick_1s: "tick_after_audio_idle_repeat_1s",
   async_tool_polling: "async_tool_polling",
 };
 const TICK_MODE_LABELS: Record<TickMode, string> = {
   native_no_tick: "no_tick",
   same_call_pending_function_response_3000ms: "with_tick_tool_response",
   client_status_tick_3000ms: "with_tick_client_content",
+  periodic_tick_4s: "periodic_tick_4s",
+  tick_after_utterance_0s: "tick_after_utterance_0s",
+  tick_after_utterance_1s: "tick_after_utterance_1s",
+  tick_after_audio_idle_0s: "tick_after_audio_idle_0s",
+  tick_after_audio_idle_1s: "tick_after_audio_idle_1s",
+  tick_after_audio_idle_repeat_0s: "tick_after_audio_idle_repeat_0s",
+  tick_after_audio_idle_repeat_1s: "tick_after_audio_idle_repeat_1s",
   async_tool_polling: "async_tool_polling",
 };
 
@@ -194,7 +244,7 @@ type AudioSegment = {
 };
 
 type TickRecord = {
-  kind: "client_status" | "interim_function_response" | "check_status_pending";
+  kind: "client_status" | "boundary_client_status" | "interim_function_response" | "check_status_pending";
   sentAtMs: number;
   sendError?: string;
 };
@@ -220,14 +270,20 @@ type AttemptState = {
   firstAudioAt?: number;
   firstAudioAfterFinalAt?: number;
   lastAudioBeforeFinalAt?: number;
+  sessionOpenedAt?: number;
   turnCompleteAt?: number;
   rawEventCount: number;
   audioTimesMs: number[];
+  outputTimesMs: number[];
   audioEventsBeforeFinal: number;
   audioEventsAfterFinal: number;
   textBeforeFinal: string[];
   textAfterFinal: string[];
   ticks: TickRecord[];
+  boundaryDetectedTimesMs: number[];
+  boundaryTickTimesMs: number[];
+  boundaryTickSkippedFinalReadyCount: number;
+  boundaryTickScheduled: boolean;
   checkStatusCalls: CheckStatusRecord[];
   cancelledToolCallIds: string[];
   sendErrors: string[];
@@ -257,8 +313,14 @@ type AttemptSummary = {
   first_audio_time_ms: number | null;
   turnComplete_time_ms: number | null;
   setupComplete_time_ms: number | null;
+  setupComplete_after_session_open_ms: number | null;
   setup_complete_before_prompt: boolean;
   last_audio_before_final_tool_response_ms: number | null;
+  pending_tick_times_ms: number[];
+  boundary_detected_times_ms: number[];
+  boundary_tick_times_ms: number[];
+  has_output_after_boundary_tick: boolean;
+  pending_tick_skipped_final_ready_count: number;
   raw_event_count: number;
   text_before_final: string[];
   text_after_final: string[];
@@ -343,7 +405,16 @@ function promptForTickMode(tickMode: TickMode): PromptProfile {
       userPrompt: NO_TICK_USER_PROMPT,
     };
   }
-  if (tickMode === "client_status_tick_3000ms") {
+  if (
+    tickMode === "client_status_tick_3000ms" ||
+    tickMode === "periodic_tick_4s" ||
+    tickMode === "tick_after_utterance_0s" ||
+    tickMode === "tick_after_utterance_1s" ||
+    tickMode === "tick_after_audio_idle_0s" ||
+    tickMode === "tick_after_audio_idle_1s" ||
+    tickMode === "tick_after_audio_idle_repeat_0s" ||
+    tickMode === "tick_after_audio_idle_repeat_1s"
+  ) {
     return {
       promptName: EXTERNAL_TICK_PROMPT_NAME,
       systemInstruction: EXTERNAL_TICK_SYSTEM_INSTRUCTION,
@@ -521,6 +592,10 @@ function computeSummary(plan: AttemptPlan, state: AttemptState): AttemptSummary 
       !tick.sendError &&
       state.audioTimesMs.some((audioMs) => audioMs >= tick.sentAtMs && audioMs <= tick.sentAtMs + 3000),
   );
+  const hasOutputAfterBoundaryTick = state.boundaryTickTimesMs.some((tickMs) =>
+    state.audioTimesMs.some((audioMs) => audioMs >= tickMs && audioMs <= tickMs + 3000) ||
+    state.outputTimesMs.some((outputMs) => outputMs >= tickMs && outputMs <= tickMs + 3000),
+  );
   return {
     condition: plan.tickMode,
     latency_ms: plan.latencyMs,
@@ -546,9 +621,15 @@ function computeSummary(plan: AttemptPlan, state: AttemptState): AttemptSummary 
         : null,
     first_audio_time_ms: msDelta(state.promptSentAt, state.firstAudioAt),
     turnComplete_time_ms: msDelta(state.promptSentAt, state.turnCompleteAt),
-    setupComplete_time_ms: msDelta(state.promptSentAt, state.setupCompleteAt),
+    setupComplete_time_ms: msDelta(state.sessionOpenedAt, state.setupCompleteAt),
+    setupComplete_after_session_open_ms: msDelta(state.sessionOpenedAt, state.setupCompleteAt),
     setup_complete_before_prompt: Boolean(state.setupCompleteAt && state.promptSentAt && state.setupCompleteAt <= state.promptSentAt),
     last_audio_before_final_tool_response_ms: msDelta(state.promptSentAt, state.lastAudioBeforeFinalAt),
+    pending_tick_times_ms: state.ticks.filter((tick) => !tick.sendError).map((tick) => tick.sentAtMs),
+    boundary_detected_times_ms: state.boundaryDetectedTimesMs,
+    boundary_tick_times_ms: state.boundaryTickTimesMs,
+    has_output_after_boundary_tick: hasOutputAfterBoundaryTick,
+    pending_tick_skipped_final_ready_count: state.boundaryTickSkippedFinalReadyCount,
     raw_event_count: state.rawEventCount,
     text_before_final: state.textBeforeFinal,
     text_after_final: state.textAfterFinal,
@@ -577,11 +658,16 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
     toolCallCount: 0,
     rawEventCount: 0,
     audioTimesMs: [],
+    outputTimesMs: [],
     audioEventsBeforeFinal: 0,
     audioEventsAfterFinal: 0,
     textBeforeFinal: [],
     textAfterFinal: [],
     ticks: [],
+    boundaryDetectedTimesMs: [],
+    boundaryTickTimesMs: [],
+    boundaryTickSkippedFinalReadyCount: 0,
+    boundaryTickScheduled: false,
     checkStatusCalls: [],
     cancelledToolCallIds: [],
     sendErrors: [],
@@ -592,6 +678,10 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
   let resolveRunRef: (() => void) | undefined;
   let postFinalObservationScheduled = false;
   let initialPromptSent = false;
+  let audioIdleBoundaryTimer: ReturnType<typeof setTimeout> | undefined;
+  let audioPlaybackCursorMs = 0;
+  let repeatBoundaryTickPending = false;
+  let lastBoundaryTickSentAtMs: number | null = null;
   const timers: ReturnType<typeof setTimeout>[] = [];
   const jobId = `job_${plan.tickMode}_${plan.attemptIndex}_${Date.now()}`;
 
@@ -713,8 +803,16 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
     );
   };
 
+  const clientTickTimes = (): number[] => {
+    if (plan.tickMode === "client_status_tick_3000ms") return TICK_TIMES_MS.filter((tickMs) => tickMs < plan.latencyMs);
+    if (plan.tickMode !== "periodic_tick_4s") return [];
+    const times: number[] = [];
+    for (let tickMs = 4000; tickMs < plan.latencyMs; tickMs += 4000) times.push(tickMs);
+    return times;
+  };
+
   const scheduleClientTicks = () => {
-    for (const tickMs of TICK_TIMES_MS.filter((tickMs) => tickMs < plan.latencyMs)) {
+    for (const tickMs of clientTickTimes()) {
       timers.push(
         setTimeout(() => {
           if (done || state.sessionClosed) return;
@@ -741,6 +839,122 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
         }, tickMs),
       );
     }
+  };
+
+  const boundaryTickDelayMs = (): number | null => {
+    if (plan.tickMode === "tick_after_utterance_0s") return 0;
+    if (plan.tickMode === "tick_after_utterance_1s") return 1000;
+    if (plan.tickMode === "tick_after_audio_idle_0s") return 0;
+    if (plan.tickMode === "tick_after_audio_idle_1s") return 1000;
+    if (plan.tickMode === "tick_after_audio_idle_repeat_0s") return 0;
+    if (plan.tickMode === "tick_after_audio_idle_repeat_1s") return 1000;
+    return null;
+  };
+
+  const usesAudioIdleBoundary = (): boolean =>
+    plan.tickMode === "tick_after_audio_idle_0s" ||
+    plan.tickMode === "tick_after_audio_idle_1s" ||
+    plan.tickMode === "tick_after_audio_idle_repeat_0s" ||
+    plan.tickMode === "tick_after_audio_idle_repeat_1s";
+
+  const usesRepeatAudioIdleBoundary = (): boolean =>
+    plan.tickMode === "tick_after_audio_idle_repeat_0s" || plan.tickMode === "tick_after_audio_idle_repeat_1s";
+
+  const scheduleAudioIdleBoundary = (audioStartMs: number, audioDurationMs: number) => {
+    if (!usesAudioIdleBoundary()) return;
+    if (!usesRepeatAudioIdleBoundary() && state.boundaryTickScheduled) return;
+    if (repeatBoundaryTickPending || done || state.sessionClosed || !state.promptSentAt) return;
+    if (!state.mainToolCallAt || state.finalToolResponseSentAt) return;
+    if (audioIdleBoundaryTimer) clearTimeout(audioIdleBoundaryTimer);
+    audioPlaybackCursorMs = Math.max(audioPlaybackCursorMs, audioStartMs) + audioDurationMs;
+    const waitMs = Math.max(0, Math.ceil(audioPlaybackCursorMs + AUDIO_IDLE_BOUNDARY_MS - audioStartMs));
+    audioIdleBoundaryTimer = setTimeout(() => {
+      maybeScheduleBoundaryTick(`audio_playback_idle_${AUDIO_IDLE_BOUNDARY_MS}ms`);
+    }, waitMs);
+    timers.push(audioIdleBoundaryTimer);
+  };
+
+  const maybeScheduleBoundaryTick = (detectionMethod = "turn_complete") => {
+    const delayMs = boundaryTickDelayMs();
+    if (delayMs === null) return;
+    const repeatMode = usesRepeatAudioIdleBoundary();
+    if ((!repeatMode && state.boundaryTickScheduled) || repeatBoundaryTickPending || done || state.sessionClosed || !state.promptSentAt) return;
+    if (!state.mainToolCallAt) return;
+    const detectedAtMs = Date.now() - state.promptSentAt;
+    if (repeatMode && lastBoundaryTickSentAtMs !== null && detectedAtMs - lastBoundaryTickSentAtMs < REPEAT_BOUNDARY_MIN_GAP_MS) {
+      appendTimeline("boundary_tick_skipped_cooldown", {
+        detection_method: detectionMethod,
+        min_gap_ms: REPEAT_BOUNDARY_MIN_GAP_MS,
+        ms_since_last_tick: detectedAtMs - lastBoundaryTickSentAtMs,
+      });
+      appendJsonl(rawLogPath, {
+        type: "boundary_tick_skipped_cooldown",
+        event_ms: detectedAtMs,
+        detection_method: detectionMethod,
+        min_gap_ms: REPEAT_BOUNDARY_MIN_GAP_MS,
+        ms_since_last_tick: detectedAtMs - lastBoundaryTickSentAtMs,
+      });
+      return;
+    }
+    if (state.finalToolResponseSentAt) {
+      state.boundaryTickSkippedFinalReadyCount += 1;
+      appendTimeline("boundary_tick_skipped_final_ready", { delay_ms: delayMs });
+      appendJsonl(rawLogPath, {
+        type: "boundary_tick_skipped_final_ready",
+        event_ms: Date.now() - state.promptSentAt,
+        delay_ms: delayMs,
+      });
+      return;
+    }
+    if (repeatMode) repeatBoundaryTickPending = true;
+    else state.boundaryTickScheduled = true;
+    state.boundaryDetectedTimesMs.push(detectedAtMs);
+    appendTimeline("speech_boundary_detected", { detection_method: detectionMethod, delay_ms: delayMs });
+    appendJsonl(rawLogPath, {
+      type: "speech_boundary_detected",
+      event_ms: detectedAtMs,
+      detection_method: detectionMethod,
+      delay_ms: delayMs,
+    });
+    timers.push(
+      setTimeout(() => {
+        if (done || state.sessionClosed || !state.promptSentAt) return;
+        if (state.finalToolResponseSentAt) {
+          state.boundaryTickSkippedFinalReadyCount += 1;
+          if (repeatMode) repeatBoundaryTickPending = false;
+          appendTimeline("boundary_tick_skipped_final_ready", { delay_ms: delayMs });
+          appendJsonl(rawLogPath, {
+            type: "boundary_tick_skipped_final_ready",
+            event_ms: Date.now() - state.promptSentAt,
+            delay_ms: delayMs,
+          });
+          return;
+        }
+        const sentAtMs = Date.now() - state.promptSentAt;
+        const tick: TickRecord = { kind: "boundary_client_status", sentAtMs };
+        try {
+          session?.sendRealtimeInput({ text: clientPendingMessage() });
+          state.boundaryTickTimesMs.push(sentAtMs);
+          lastBoundaryTickSentAtMs = sentAtMs;
+          appendTimeline("boundary_client_status_tick_sent", {
+            send_method: "sendRealtimeInput",
+            delay_ms: delayMs,
+            message: clientPendingMessage(),
+          });
+          appendJsonl(rawLogPath, {
+            type: "boundary_client_status_tick_sent",
+            event_ms: sentAtMs,
+            send_method: "sendRealtimeInput",
+            delay_ms: delayMs,
+            message: clientPendingMessage(),
+          });
+        } catch (error) {
+          tick.sendError = noteSendError("boundary_client_status_tick", error);
+        }
+        state.ticks.push(tick);
+        if (repeatMode) repeatBoundaryTickPending = false;
+      }, delayMs),
+    );
   };
 
   const scheduleInterimResponses = (call: FunctionCall) => {
@@ -782,6 +996,7 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
         },
         callbacks: {
           onopen: () => {
+            state.sessionOpenedAt = Date.now();
             appendTimeline("session_opened", { model });
             appendJsonl(rawLogPath, { type: "session_opened", model });
           },
@@ -825,13 +1040,16 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
               }
               if (state.finalToolResponseSentAt) state.textAfterFinal.push(text);
               else state.textBeforeFinal.push(text);
+              if (eventMs !== null) state.outputTimesMs.push(eventMs);
               appendTimeline(isTranscription ? "output_transcription" : "text_output", { text });
             }
             for (const part of parts) {
               if (!part.inlineData?.data) continue;
               const chunk = Buffer.from(part.inlineData.data, "base64");
+              const audioDurationMs = (chunk.length / 48_000) * 1000;
               audioSegments.push({ offsetMs: eventMs ?? 0, chunk, mimeType: part.inlineData.mimeType });
               if (eventMs !== null) state.audioTimesMs.push(eventMs);
+              if (eventMs !== null) state.outputTimesMs.push(eventMs);
               state.firstAudioAt ??= now;
               if (state.finalToolResponseSentAt) {
                 state.audioEventsAfterFinal += 1;
@@ -845,6 +1063,7 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
                 mime_type: part.inlineData.mimeType,
                 phase: state.finalToolResponseSentAt ? "after_tool_response" : "before_tool_response",
               });
+              if (!state.finalToolResponseSentAt && eventMs !== null) scheduleAudioIdleBoundary(eventMs, audioDurationMs);
             }
 
             if (message.toolCall?.functionCalls?.length) {
@@ -889,7 +1108,10 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
                     if (ok) state.mainToolResponseSentAt = Date.now();
                     continue;
                   }
-                  if (plan.tickMode === "client_status_tick_3000ms") scheduleClientTicks();
+                  if (plan.tickMode === "client_status_tick_3000ms" || plan.tickMode === "periodic_tick_4s") scheduleClientTicks();
+                  if (plan.tickMode === "tick_after_utterance_0s" || plan.tickMode === "tick_after_utterance_1s") {
+                    // Boundary ticks are scheduled from the first pre-final turnComplete after this tool call.
+                  }
                   if (plan.tickMode === "same_call_pending_function_response_3000ms") scheduleInterimResponses(call);
                   scheduleFinalMainResponse(call);
                 }
@@ -911,6 +1133,9 @@ async function runOne(ai: GoogleGenAI, model: string, plan: AttemptPlan): Promis
             if (message.serverContent?.turnComplete) {
               state.turnCompleteAt ??= now;
               appendTimeline("turn_complete");
+              if (plan.tickMode === "tick_after_utterance_0s" || plan.tickMode === "tick_after_utterance_1s") {
+                maybeScheduleBoundaryTick("turn_complete");
+              }
             }
           },
           onerror: (error) => {
@@ -1065,6 +1290,13 @@ async function main(): Promise<void> {
     prompt_routing: {
       native_no_tick: NO_TICK_PROMPT_NAME,
       client_status_tick_3000ms: EXTERNAL_TICK_PROMPT_NAME,
+      periodic_tick_4s: EXTERNAL_TICK_PROMPT_NAME,
+      tick_after_utterance_0s: EXTERNAL_TICK_PROMPT_NAME,
+      tick_after_utterance_1s: EXTERNAL_TICK_PROMPT_NAME,
+      tick_after_audio_idle_0s: EXTERNAL_TICK_PROMPT_NAME,
+      tick_after_audio_idle_1s: EXTERNAL_TICK_PROMPT_NAME,
+      tick_after_audio_idle_repeat_0s: EXTERNAL_TICK_PROMPT_NAME,
+      tick_after_audio_idle_repeat_1s: EXTERNAL_TICK_PROMPT_NAME,
       same_call_pending_function_response_3000ms: WITH_TICK_PROMPT_NAME,
       async_tool_polling: WITH_TICK_PROMPT_NAME,
     },
