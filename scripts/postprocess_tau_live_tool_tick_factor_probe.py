@@ -27,6 +27,7 @@ TEXT_COLOR = "#F57C00"
 TEXT_EDGE_COLOR = "white"
 TICK_TYPES = {
     "client_status_tick_sent",
+    "boundary_client_status_tick_sent",
     "interim_function_response_sent",
     "check_status_pending_response_sent",
     "main_pending_tool_response_sent",
@@ -195,6 +196,7 @@ def max_time_ms(events: list[dict], segments: list[dict], texts: list[dict], clo
         "tool_call_received",
         "final_tool_response_sent",
         "client_status_tick_sent",
+        "boundary_client_status_tick_sent",
         "interim_function_response_sent",
         "check_status_pending_response_sent",
         "main_pending_tool_response_sent",
